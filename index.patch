@@ -1,0 +1,270 @@
+--- a/dsh-client-ui-goal/lib/client.js	2026-11-12 10:14:45.242064483 +0800
++++ b/dsh-client-ui-goal/lib/client.js	2026-11-12 10:14:45.247078929 +0800
+@@ -11,7 +11,7 @@
+ 		/** Goal activation observable that orders Remote reads and live activation events. */
+ 		/** Compare two empty-or-populated activation snapshots by value. */
+ 		function sameSnapshot(left, right) {
+-			return left.id === right.id && left.revision === right.revision && left.activation === right.activation;
++			return left.id === right.id && left.revision === right.revision && left.activation === right.activation && left.waitingSubagents === right.waitingSubagents;
+ 		}
+ 		/** Return the current active CAS ref, or undefined when the goal is not active. */
+ 		function activeRef(projection) {
+@@ -38,6 +38,46 @@
+ 				snapshot = next;
+ 				for (const listener of listeners) listener();
+ 			};
++			/**
++			* Count live direct and nested subagent Sessions owned by this Session.
++			* The Host list is the live authority: a settled or cancelled child is no
++			* longer `running`, even when its catalog row survives in history. Only
++			* the parent being idle can leave the goal-round driver waiting, so a
++			* running parent reports zero.
++			*/
++			const runningSubagents = () => {
++				if (deps.session.getSnapshot().running) return 0;
++				const rows = Object.values(deps.sessions.list.getSnapshot().byId);
++				const byParent = /* @__PURE__ */ new Map();
++				for (const row of rows) {
++					if (row.parentId === void 0) continue;
++					const siblings = byParent.get(row.parentId);
++					if (siblings === void 0) byParent.set(row.parentId, [row]);
++					else siblings.push(row);
++				}
++				let count = 0;
++				const seen = /* @__PURE__ */ new Set();
++				const walk = (parentId) => {
++					for (const row of byParent.get(parentId) ?? []) {
++						if (seen.has(row.id)) continue;
++						seen.add(row.id);
++						if (row.running) count++;
++						walk(row.id);
++					}
++				};
++				walk(deps.sessionId);
++				return count;
++			};
++			/** Publish a changed subagent-wait count without touching activation. */
++			const publishWaiting = () => {
++				if (snapshot.id === void 0) return;
++				const waitingSubagents = runningSubagents();
++				if (snapshot.waitingSubagents === waitingSubagents) return;
++				publish({
++					...snapshot,
++					waitingSubagents
++				});
++			};
+ 			const startRead = (ref) => {
+ 				if (ref === void 0) return;
+ 				const read = ++readEpoch;
+@@ -55,7 +95,8 @@
+ 					publish({
+ 						id: goal.id,
+ 						revision: goal.revision,
+-						activation: goal.activation
++						activation: goal.activation,
++						waitingSubagents: runningSubagents()
+ 					});
+ 				}, (error) => {
+ 					console.warn("[ui-goal] goal activation read failed:", error);
+@@ -71,7 +112,8 @@
+ 				}
+ 				if (snapshot.id !== ref.id || snapshot.revision !== ref.revision) publish({
+ 					id: ref.id,
+-					revision: ref.revision
++					revision: ref.revision,
++					waitingSubagents: runningSubagents()
+ 				});
+ 				startRead(ref);
+ 			};
+@@ -81,29 +123,35 @@
+ 				publish(goal === void 0 ? {} : {
+ 					id: goal.id,
+ 					revision: goal.revision,
+-					activation: goal.activation
++					activation: goal.activation,
++					waitingSubagents: typeof goal.waitingSubagents === "number" ? goal.waitingSubagents : runningSubagents()
+ 				});
+ 			};
+ 			const onRunning = () => {
+ 				const next = deps.session.getSnapshot().running;
+ 				if (next === running) return;
+ 				running = next;
++				publishWaiting();
+ 				startRead(activeRef(deps.projection.getSnapshot()));
+ 			};
+ 			const onReset = () => {
+ 				eventEpoch++;
+ 				projectionEpoch++;
++				publishWaiting();
+ 				startRead(activeRef(deps.projection.getSnapshot()));
+ 			};
++			const onSubagents = () => publishWaiting();
+ 			const start = () => {
+ 				disposers = [
+ 					deps.projection.subscribe(refreshProjection),
+ 					deps.session.subscribe(onRunning),
++					deps.sessions.list.subscribe(onSubagents),
+ 					deps.subscribeActivation(onActivation),
+ 					deps.subscribeReset(onReset)
+ 				];
+ 				running = deps.session.getSnapshot().running;
+ 				refreshProjection();
++				publishWaiting();
+ 			};
+ 			const stop = () => {
+ 				for (const dispose of disposers) dispose();
+@@ -168,7 +216,7 @@
+ 			if (activation === "disarmed") return t("phase.active.disarmed");
+ 			return t(PHASE_LABELS.active);
+ 		}
+-		function GoalBar({ goal, activation, onEdit, onPause, onResume, onClear, t }) {
++		function GoalBar({ goal, activation, waitingSubagents, onEdit, onPause, onResume, onClear, t }) {
+ 			const [editing, setEditing] = (0, react.useState)(false);
+ 			const [draft, setDraft] = (0, react.useState)("");
+ 			const [pending, setPending] = (0, react.useState)(false);
+@@ -264,8 +312,9 @@
+ 					]
+ 				})
+ 			});
+-			const title = goal.phase === "blocked" ? goal.blockedReason?.message : void 0;
+-			const label = goal.phase === "active" ? activeLabel(activation, t) : t(PHASE_LABELS[goal.phase]);
++			const waiting = goal.phase === "active" && activation === "armed" && typeof waitingSubagents === "number" && waitingSubagents > 0 ? waitingSubagents : 0;
++			const title = goal.phase === "blocked" ? goal.blockedReason?.message : waiting > 0 ? t("phase.active.waiting.tooltip") : void 0;
++			const label = goal.phase === "active" ? waiting > 0 ? t(waiting === 1 ? "phase.active.waiting.one" : "phase.active.waiting.other", { count: waiting }) : activeLabel(activation, t) : t(PHASE_LABELS[goal.phase]);
+ 			const showResume = goal.phase === "paused" || goal.phase === "active" && activation === "disarmed";
+ 			return (0, react_jsx_runtime.jsx)("div", {
+ 				className: GoalBar_module_css_default.dock,
+@@ -371,10 +420,13 @@
+ 			const goal = projection === void 0 || projection === null ? projection : projection.goal;
+ 			const goalId = goal?.id;
+ 			const revision = goal?.revision;
+-			const activation = useGoalActivation((next) => next.id === goalId && next.revision === revision ? next.activation : void 0);
++			const live = useGoalActivation((next) => next.id === goalId && next.revision === revision ? next : void 0);
++			const activation = live?.activation;
++			const waitingSubagents = live?.waitingSubagents;
+ 			return (0, react_jsx_runtime.jsx)(GoalBar, {
+ 				goal,
+ 				...activation === void 0 ? {} : { activation },
++				...waitingSubagents === void 0 ? {} : { waitingSubagents },
+ 				onEdit,
+ 				onPause,
+ 				onResume,
+@@ -524,6 +576,9 @@
+ 		const zh = {
+ 			"phase.active": "进行中的目标",
+ 			"phase.active.disarmed": "已暂停的目标",
++			"phase.active.waiting.one": "等待 {count} 个子代理完成",
++			"phase.active.waiting.other": "等待 {count} 个子代理完成",
++			"phase.active.waiting.tooltip": "子代理仍在运行，目标将在它们结束后继续",
+ 			"phase.paused": "已暂停的目标",
+ 			"phase.blocked": "受阻的目标",
+ 			"objective.aria": "目标内容",
+@@ -539,6 +594,9 @@
+ 		const en = {
+ 			"phase.active": "Ongoing Goal",
+ 			"phase.active.disarmed": "Inactive Goal",
++			"phase.active.waiting.one": "Waiting for {count} subagent to finish",
++			"phase.active.waiting.other": "Waiting for {count} subagents to finish",
++			"phase.active.waiting.tooltip": "Subagents are still running; the goal continues when they finish",
+ 			"phase.paused": "Paused Goal",
+ 			"phase.blocked": "Blocked Goal",
+ 			"objective.aria": "Goal objective",
+@@ -613,6 +671,8 @@
+ 						hooks: { goalActivation: createGoalActivationSource({
+ 							projection: binding.session.projections.faceOf("goal"),
+ 							session: binding.session,
++							sessions,
++							sessionId,
+ 							getGoal: async () => {
+ 								if (sessions.binding(sessionId) !== binding) throw new Error(`ui-goal: session "${sessionId}" is unavailable`);
+ 								return sessions.using(sessionId, { source: "goalActivation" }, async (reference) => {
+--- a/dsh-client-ui-goal/lib/types/client/activation-source.d.ts	2026-11-12 10:14:45.264724746 +0800
++++ b/dsh-client-ui-goal/lib/types/client/activation-source.d.ts	2026-11-12 10:14:45.269471765 +0800
+@@ -1,7 +1,9 @@
+ /** Goal activation observable that orders Remote reads and live activation events. */
+ import type { RemoteResult } from '@deepseek-ai/dsh-api-remotes/client';
++import type { SessionListState } from '@deepseek-ai/dsh-api-session-controller/client';
+ import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots';
+ import type { GoalActivationChanged, GoalProjection, GoalView } from '@deepseek-ai/dsh-goal/client';
++import type { SessionId } from '@deepseek-ai/dsh-session/types';
+ import type { GoalActivationSnapshot } from './slots.ts';
+ /** Live inputs for one Session's goal activation source. */
+ export interface GoalActivationDeps {
+@@ -11,6 +13,12 @@
+     readonly session: HostObservable<{
+         readonly running: boolean;
+     }>;
++    /** Client Session list; live child `running` rows drive the optional wait label. */
++    readonly sessions: {
++        readonly list: HostObservable<SessionListState>;
++    };
++    /** Parent Session whose direct and nested descendants are counted. */
++    readonly sessionId: SessionId;
+     /** Read live activation after initial history; rejected reads leave the current snapshot unchanged. */
+     readonly getGoal: () => Promise<RemoteResult<GoalView | undefined>>;
+     /** Subscribe to activation edges after the transport delivers them. */
+--- a/dsh-client-ui-goal/lib/types/client/GoalBar.d.ts	2026-11-12 10:14:45.287740924 +0800
++++ b/dsh-client-ui-goal/lib/types/client/GoalBar.d.ts	2026-11-12 10:14:45.291706915 +0800
+@@ -15,8 +15,10 @@
+     goal: GoalSnapshot | null | undefined;
+     /** Process-local continuation activation; absent while the live read is pending. */
+     activation?: GoalActivation;
++    /** Running subagent Sessions the goal-round driver is waiting for before the next round. */
++    waitingSubagents?: number;
+ }
+-export declare function GoalBar({ goal, activation, onEdit, onPause, onResume, onClear, t }: GoalBarProps & PropsLocale<'goal'>): import("react").JSX.Element | null;
++export declare function GoalBar({ goal, activation, waitingSubagents, onEdit, onPause, onResume, onClear, t }: GoalBarProps & PropsLocale<'goal'>): import("react").JSX.Element | null;
+ /** Full props of the dock entry: InputZone owner share + injected verbs/activation hook + the locale seat. */
+ export type GoalDockProps = import('@deepseek-ai/dsh-client-ui-slots').PropsRuntime<'conversation.input.dock'> & InjectFace<GoalBarInjected> & PropsLocale<'goal'>;
+ /** Dock adapter: overlays process-local activation on the durable goal projection. */
+--- a/dsh-client-ui-goal/lib/types/client/slots.d.ts	2026-11-12 10:14:45.315977065 +0800
++++ b/dsh-client-ui-goal/lib/types/client/slots.d.ts	2026-11-12 10:14:45.322707597 +0800
+@@ -34,6 +34,12 @@
+     readonly revision?: number;
+     /** Process-local continuation state; absent while no matching edge is known. */
+     readonly activation?: GoalActivation;
++    /**
++     * Live running subagent Sessions still owned by this goal Session. The
++     * goal-round driver waits for them before starting the next round, so a
++     * positive count explains an idle parent with an armed goal.
++     */
++    readonly waitingSubagents?: number;
+ }
+ /** Registrant-private observable source bound by the slot renderer. */
+ export interface GoalActivationInjected {
+--- a/dsh-client-ui-goal/lib/types/client/locales.d.ts	2026-11-12 10:14:45.348708169 +0800
++++ b/dsh-client-ui-goal/lib/types/client/locales.d.ts	2026-11-12 10:14:45.357039291 +0800
+@@ -3,6 +3,9 @@
+ export declare const zh: {
+     'phase.active': string;
+     'phase.active.disarmed': string;
++    'phase.active.waiting.one': string;
++    'phase.active.waiting.other': string;
++    'phase.active.waiting.tooltip': string;
+     'phase.paused': string;
+     'phase.blocked': string;
+     'objective.aria': string;
+@@ -20,6 +23,9 @@
+ export declare const en: {
+     'phase.active': string;
+     'phase.active.disarmed': string;
++    'phase.active.waiting.one': string;
++    'phase.active.waiting.other': string;
++    'phase.active.waiting.tooltip': string;
+     'phase.paused': string;
+     'phase.blocked': string;
+     'objective.aria': string;
+--- a/dsh-goal/lib/types/types.d.ts	2026-11-12 10:14:45.382928115 +0800
++++ b/dsh-goal/lib/types/types.d.ts	2026-11-12 10:14:45.390126019 +0800
+@@ -68,6 +68,11 @@
+         readonly revision: number;
+         /** Current process-local continuation state. */
+         readonly activation: GoalActivation;
++        /**
++         * Live subagent Sessions the continuation driver is waiting for before
++         * the next round. Optional and process-local; absent means zero.
++         */
++        readonly waitingSubagents?: number;
+     };
+ }
+ /** Current goal projection, including values derived from the session log. */
